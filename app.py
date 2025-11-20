@@ -427,7 +427,33 @@ def show_recap_screen(lc):
                         st.balloons()
                         msg_succes = "🎉 Félicitations ! Le questionnaire a été rempli sans erreur et envoyé avec succès. / مبروك! تم ملء الاستبيان بنجاح وإرساله."
                         st.success(msg_succes)
-                        play_audio_auto(msg_succes, lc) # Petit bonus: l'assistant félicite vocalement
+                        def play_audio_auto(text, lang):
+    """Joue l'audio en utilisant le lecteur natif Streamlit (plus fiable sur le Cloud)"""
+    if not LIBS_OK: return
+    try:
+        # Génération du son
+        tts = gTTS(text, lang=lang)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        
+        # On affiche un lecteur audio, mais on le rend invisible visuellement via CSS
+        # pour garder l'aspect "Assistant vocal" tout en respectant les règles du navigateur.
+        
+        # 1. Le lecteur natif (qui gère le chargement du fichier)
+        # Note: autoplay=True fonctionne si l'utilisateur a déjà cliqué sur la page
+        st.audio(fp, format='audio/mp3', autoplay=True)
+        
+        # 2. Petite astuce CSS pour cacher le lecteur audio (le rendre invisible)
+        # Si vous préférez voir le lecteur pour être sûr, supprimez ces 3 lignes :
+        st.markdown("""
+            <style>
+                audio { display: none !important; }
+            </style>
+        """, unsafe_allow_html=True)
+        
+    except Exception as e:
+        # En cas d'erreur silencieuse
+        pass
                         
                         time.sleep(5)
                         st.session_state.data = {}
