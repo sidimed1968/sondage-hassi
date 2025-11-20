@@ -18,7 +18,7 @@ try:
 except ImportError:
     LIBS_OK = False
 
-# --- LISTE DES QUESTIONS PRINCIPALES ---
+# --- LISTE DES QUESTIONS PRINCIPALES (Q1-Q14 et Q26-Q27) ---
 QUESTIONS_MAIN = [
     # PARTIE A
     {"id": "Q1", "key": "NomFamille", "fr": "1. Nom de la famille ?", "ar": "1. اسم الأسرة؟", "type": "text"},
@@ -50,39 +50,66 @@ QUESTIONS_MAIN = [
 ]
 
 # --- FONCTIONS ---
+
 def play_audio_auto(text, lang):
-    """Joue l'audio via HTML caché"""
+    """
+    Joue l'audio en utilisant le lecteur natif Streamlit (compatible Cloud).
+    Cache le lecteur visuellement pour garder l'aspect 'Assistant'.
+    """
     if not LIBS_OK: return
     try:
+        # Génération du son
         tts = gTTS(text, lang=lang)
         fp = io.BytesIO()
         tts.write_to_fp(fp)
-        b64 = base64.b64encode(fp.getvalue()).decode()
-        rnd = int(time.time() * 1000)
-        md = f"""
-            <audio autoplay="true" style="display:none;" id="audio_{rnd}">
-            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-            </audio>
-            """
-        st.empty().markdown(md, unsafe_allow_html=True)
+        
+        # Lecteur audio invisible mais en autoplay
+        st.audio(fp, format='audio/mp3', autoplay=True)
+        
+        # CSS pour cacher le lecteur (optionnel, enlever si besoin de debug)
+        st.markdown("""
+            <style>
+                audio { display: none !important; }
+            </style>
+        """, unsafe_allow_html=True)
+        
     except Exception:
         pass
 
 def connect_google_sheet():
-    if not os.path.exists(CREDENTIALS_FILE): return None, "Fichier credentials.json manquant"
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME).sheet1
-        return sheet, "OK"
-    except Exception as e:
-        return None, str(e)
+    """Connexion compatible PC (fichier local) et Cloud (Secrets)"""
+    
+    # 1. Priorité : Secrets du Cloud (Streamlit Community Cloud)
+    if "gcp_service_account" in st.secrets:
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds_dict = st.secrets["gcp_service_account"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            sheet = client.open(SHEET_NAME).sheet1
+            return sheet, "OK"
+        except Exception as e:
+            return None, str(e)
+
+    # 2. Sinon : Fichier local (Pour test sur PC)
+    elif os.path.exists(CREDENTIALS_FILE):
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+            client = gspread.authorize(creds)
+            sheet = client.open(SHEET_NAME).sheet1
+            return sheet, "OK"
+        except Exception as e:
+            return None, str(e)
+    
+    else:
+        return None, "Aucune méthode de connexion trouvée (Ni Secrets, ni Fichier JSON)."
 
 # --- LOGIQUE PRINCIPALE ---
 def main():
     st.set_page_config(page_title="Sondage Hassi", layout="centered")
 
+    # Initialisation des variables de session
     if "data" not in st.session_state: st.session_state.data = {}
     if "children" not in st.session_state: st.session_state.children = []
     if "q_index" not in st.session_state: st.session_state.q_index = -1
@@ -92,7 +119,7 @@ def main():
     if "in_child_loop" not in st.session_state: st.session_state.in_child_loop = False
     if "edit_mode" not in st.session_state: st.session_state.edit_mode = False
 
-    # Accueil
+    # --- ECRAN D'ACCUEIL ---
     if st.session_state.q_index == -1:
         st.title("📋 Enquête Hassi Elbekay")
         st.info("Cliquez sur DÉMARRER pour lancer l'assistant.")
@@ -105,23 +132,29 @@ def main():
 
     lc = st.session_state.lang
 
-    # Gestion des Flux
+    # --- GESTION DU FLUX ---
+    # 1. Fin du questionnaire -> Récapitulatif
     if st.session_state.q_index >= len(QUESTIONS_MAIN):
         show_recap_screen(lc)
         return
 
+    # 2. Boucle Enfants
     if st.session_state.in_child_loop:
         handle_child_loop(lc)
         return
 
+    # 3. Question Principale Standard
     q_data = QUESTIONS_MAIN[st.session_state.q_index]
     show_main_question(q_data, lc)
 
 def show_main_question(q, lc):
+    # Barre de progression
     st.progress((st.session_state.q_index + 1) / (len(QUESTIONS_MAIN) + 1))
+    
     txt = q[lc]
     st.markdown(f"## {txt}")
     
+    # Audio : Jouer seulement si la question change
     if "last_spoken_q" not in st.session_state or st.session_state.last_spoken_q != q["id"]:
         play_audio_auto(txt, lc)
         st.session_state.last_spoken_q = q["id"]
@@ -129,6 +162,7 @@ def show_main_question(q, lc):
     val_key = q["key"]
     old_val = st.session_state.data.get(val_key)
 
+    # Formulaire
     with st.form(key=f"form_{val_key}"):
         res = None
         
@@ -147,7 +181,8 @@ def show_main_question(q, lc):
             opts = q[f"opts_{lc}"]
             current_selection = old_val
             precision_val = ""
-            if old_val and "Autre" in str(old_val) and ":" in str(old_val):
+            # Gestion de la sauvegarde "Autre: ..."
+            if old_val and ("Autre" in str(old_val) or "أخرى" in str(old_val)) and ":" in str(old_val):
                  current_selection = opts[-1]
                  precision_val = str(old_val).split(":", 1)[1].strip()
             elif old_val not in opts:
@@ -192,18 +227,23 @@ def show_main_question(q, lc):
                 st.session_state.data["Lat"] = lat
                 st.session_state.data["Long"] = lng
             
+            # --- LOGIQUE DE SAUT (JUMPS) ---
+            
+            # 1. Si Q5 (En vie) == Non -> Aller à Q13
             if q["id"] == "Q5" and res and ("Non" in str(res) or "لا" in str(res)):
                 target = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == "Q13")
                 st.session_state.q_index = target
                 st.rerun()
                 return
 
+            # 2. Si Q13 (Enfants) == Non -> Aller à Q26 (Photo)
             if q["id"] == "Q13" and res and ("Non" in str(res) or "لا" in str(res)):
                 target = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == "Q26")
                 st.session_state.q_index = target
                 st.rerun()
                 return
 
+            # 3. Si Q14 (Nb Enfants) > 0 -> Boucle Enfants
             if q["id"] == "Q14":
                 nb = int(res)
                 st.session_state.data["NbEnfants"] = nb
@@ -216,6 +256,7 @@ def show_main_question(q, lc):
                     st.rerun()
                     return
 
+            # Navigation standard
             if st.session_state.edit_mode:
                 st.session_state.edit_mode = False
                 st.session_state.q_index = len(QUESTIONS_MAIN)
@@ -236,6 +277,8 @@ def handle_child_loop(lc):
 
     d = st.session_state.children[idx]
 
+    # --- CHAMPS SANS FORMULAIRE POUR INTERACTIVITÉ ---
+
     # 15. NOM
     lbl_15 = "15. Nom de l'enfant / اسم الولد"
     nom = st.text_input(lbl_15, value=d.get("Nom", ""), key=f"c_nom_{idx}")
@@ -252,26 +295,21 @@ def handle_child_loop(lc):
     
     # 18. NIVEAU
     lbl_18 = "18. Niveau scolaire / المستوى الدراسي"
-    niv_opts = ["Sans", "Primaire", "Secondaire", "Universitaire", "Mahadra"]
-    # Mapping Arabe pour l'affichage si nécessaire, mais on garde les valeurs FR pour la logique interne
-    # Si vous voulez afficher en arabe dans la liste :
-    niv_opts_display = niv_opts
-    if lc == "ar":
-        niv_opts_display = ["بدون مستوى", "ابتدائي", "ثانوي", "جامعي", "محظرة"]
+    # Valeurs stockées en FR pour simplicité, affichage bilingue géré par l'index
+    niv_opts_fr = ["Sans", "Primaire", "Secondaire", "Universitaire", "Mahadra"]
+    niv_opts_ar = ["بدون مستوى", "ابتدائي", "ثانوي", "جامعي", "محظرة"]
+    niv_opts_display = niv_opts_fr if lc == "fr" else niv_opts_ar
     
-    # Logique de récupération valeur (on stocke en FR par simplicité ou on stocke ce qui est affiché)
-    # Ici on stocke la valeur affichée
+    # On stocke la valeur affichée
     saved_niv = d.get("Niveau", niv_opts_display[0])
     try: idx_niv = niv_opts_display.index(saved_niv)
     except: idx_niv = 0
     niv = st.selectbox(lbl_18, niv_opts_display, index=idx_niv, key=f"c_niv_{idx}")
     
-    # 19. SITUATION PRO (CORRECTION DEMANDEE)
+    # 19. SITUATION PRO (Avec tiret neutre)
     lbl_19 = "19. Situation professionnelle / الوضعية المهنية"
-    # Ajout du "-" au début pour forcer le choix
     pro_opts_fr = ["-", "Fonctionnaire", "Employé(e) privé", "Travaux libéraux", "Sans emploi", "Étudiant", "Autre"]
     pro_opts_ar = ["-", "موظف", "عامل في القطاع الخاص", "أعمال حرة", "عاطل عن العمل", "طالب", "أخرى"]
-    
     pro_opts = pro_opts_fr if lc == "fr" else pro_opts_ar
     
     saved_pro = d.get("Pro", "-")
@@ -279,9 +317,8 @@ def handle_child_loop(lc):
     except: idx_pro = 0
     pro = st.selectbox(lbl_19, pro_opts, index=idx_pro, key=f"c_pro_{idx}")
 
-    # 20. GRADE (Si Fonctionnaire)
+    # 20. GRADE (Conditionnel)
     grade = "N/A"
-    # On vérifie les mots clés dans les deux langues
     if pro in ["Fonctionnaire", "موظف"]:
         st.info("ℹ️ Grade requis / الدرجة مطلوبة")
         lbl_20 = "20. Grade / الدرجة الوظيفية"
@@ -294,7 +331,7 @@ def handle_child_loop(lc):
         except: idx_gr = 0
         grade = st.selectbox(lbl_20, gr_opts, index=idx_gr, key=f"c_grade_{idx}")
 
-    # 21. ACTIVITE FEMME
+    # 21. ACTIVITE FEMME (Conditionnel)
     act_femme = "N/A"
     if sexe in ["Femme", "امرأة"]:
         lbl_21 = "21. Activité professionnelle (si femme) / النشاط المهني (إذا كانت امرأة)"
@@ -308,7 +345,7 @@ def handle_child_loop(lc):
     except: idx_sante = 0
     sante = st.radio(lbl_22, sante_opts, index=idx_sante, key=f"c_sante_{idx}")
 
-    # 23. MALADIE (Si Malade)
+    # 23. MALADIE (Conditionnel)
     maladie = "N/A"
     if "Malade" in sante or "مريض" in sante:
         st.info("ℹ️ Préciser le type de maladie / تحديد نوع المرض")
@@ -325,20 +362,19 @@ def handle_child_loop(lc):
     # 24. AIDE
     lbl_24 = "24. A-t-il/elle bénéficié d'une aide ? / هل استفاد(ت) من مساعدة؟"
     aide_opts = ["Oui / نعم", "Non / لا"]
-    # Par défaut Non (index 1)
     saved_aide = d.get("Aide", aide_opts[1])
     try: idx_aide = aide_opts.index(saved_aide)
     except: idx_aide = 1
     aide = st.radio(lbl_24, aide_opts, index=idx_aide, key=f"c_aide_{idx}")
 
-    # 25. ORGANISME
+    # 25. ORGANISME (Conditionnel)
     orga = "N/A"
     if "Oui" in aide or "نعم" in aide:
         st.info("ℹ️ Quel organisme ? / ما هي الهيئة؟")
         lbl_25 = "25. Si oui, quel organisme ? / إذا كان الجواب 'نعم'، ما هي الهيئة؟"
         orga = st.text_input(lbl_25, value=d.get("Orga", ""), key=f"c_orga_{idx}")
 
-    # NAVIGATION
+    # Navigation Enfants
     c1, c2 = st.columns(2)
     
     child_save = {
@@ -412,7 +448,7 @@ def show_recap_screen(lc):
                         
                         ordered_row.append(str(datetime.now()))
 
-                        # 2. Données Enfants (Aplaties sur la même ligne)
+                        # 2. Données Enfants (Flattening)
                         for i, child in enumerate(st.session_state.children):
                             c_vals = [
                                 child.get("Nom", ""), child.get("Sexe", ""), child.get("Mere", ""),
@@ -427,33 +463,7 @@ def show_recap_screen(lc):
                         st.balloons()
                         msg_succes = "🎉 Félicitations ! Le questionnaire a été rempli sans erreur et envoyé avec succès. / مبروك! تم ملء الاستبيان بنجاح وإرساله."
                         st.success(msg_succes)
-                        def play_audio_auto(text, lang):
-    """Joue l'audio en utilisant le lecteur natif Streamlit (plus fiable sur le Cloud)"""
-    if not LIBS_OK: return
-    try:
-        # Génération du son
-        tts = gTTS(text, lang=lang)
-        fp = io.BytesIO()
-        tts.write_to_fp(fp)
-        
-        # On affiche un lecteur audio, mais on le rend invisible visuellement via CSS
-        # pour garder l'aspect "Assistant vocal" tout en respectant les règles du navigateur.
-        
-        # 1. Le lecteur natif (qui gère le chargement du fichier)
-        # Note: autoplay=True fonctionne si l'utilisateur a déjà cliqué sur la page
-        st.audio(fp, format='audio/mp3', autoplay=True)
-        
-        # 2. Petite astuce CSS pour cacher le lecteur audio (le rendre invisible)
-        # Si vous préférez voir le lecteur pour être sûr, supprimez ces 3 lignes :
-        st.markdown("""
-            <style>
-                audio { display: none !important; }
-            </style>
-        """, unsafe_allow_html=True)
-        
-    except Exception as e:
-        # En cas d'erreur silencieuse
-        pass
+                        play_audio_auto(msg_succes, lc)
                         
                         time.sleep(5)
                         st.session_state.data = {}
