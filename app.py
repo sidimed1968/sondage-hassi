@@ -8,7 +8,7 @@ import base64
 # --- CONFIGURATION ---
 SHEET_NAME = "Sondage_Hassi_Elbekay"
 CREDENTIALS_FILE = "credentials.json"
-MAX_ENFANTS_PREVISION = 15 # On prévoit de la place pour 15 enfants max par ligne (ajustable)
+MAX_ENFANTS_PREVISION = 15 
 
 try:
     import gspread
@@ -39,7 +39,7 @@ QUESTIONS_MAIN = [
     {"id": "Q27", "key": "GPS", "fr": "27. Coordonnées GPS", "ar": "27. إحداثيات GPS", "type": "gps"},
 ]
 
-# --- FONCTIONS ---
+# --- FONCTIONS TECHNIQUES ---
 def play_audio_auto(text, lang):
     if not LIBS_OK: return
     try:
@@ -52,49 +52,69 @@ def play_audio_auto(text, lang):
 
 def connect_google_sheet():
     if "gcp_service_account" in st.secrets:
-        try:
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds_dict = st.secrets["gcp_service_account"]
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            client = gspread.authorize(creds)
-            sheet = client.open(SHEET_NAME).sheet1
-            return sheet, "OK"
-        except Exception as e: return None, str(e)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service_account"], ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
     elif os.path.exists(CREDENTIALS_FILE):
-        try:
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-            client = gspread.authorize(creds)
-            sheet = client.open(SHEET_NAME).sheet1
-            return sheet, "OK"
-        except Exception as e: return None, str(e)
-    else: return None, "Aucune méthode de connexion."
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
+    else: return None, "Erreur Auth"
+    
+    client = gspread.authorize(creds)
+    return client.open(SHEET_NAME).sheet1, "OK"
 
 def generate_headers():
-    """Génère la liste des titres de colonnes pour Google Sheets"""
-    # 1. Colonnes Famille
     headers = [q["key"] for q in QUESTIONS_MAIN]
-    
-    # 2. Colonnes GPS détaillées
     if "Lat" not in headers: headers.append("Lat")
     if "Long" not in headers: headers.append("Long")
-    
     headers.append("Date_Enquete")
-
-    # 3. Colonnes Enfants (répétées X fois)
-    # On génère des colonnes pour 15 enfants potentiels pour que le tableau soit prêt
     child_fields = ["Nom", "Sexe", "Mere", "Niveau", "Pro", "Grade", "Act_Femme", "Sante", "Maladie", "Aide", "Orga"]
-    
     for i in range(1, MAX_ENFANTS_PREVISION + 1):
-        for field in child_fields:
-            headers.append(f"Enfant_{i}_{field}")
-            
+        for field in child_fields: headers.append(f"Enfant_{i}_{field}")
     return headers
+
+def search_and_load_data(search_term):
+    """Recherche une famille et charge les données dans la session"""
+    sheet, msg = connect_google_sheet()
+    if not sheet: return False, msg
+    
+    try:
+        # On récupère toutes les données (dictionnaires)
+        records = sheet.get_all_records()
+        
+        # Recherche (sur ChefFamille ou NomFamille)
+        results = []
+        for idx, row in enumerate(records):
+            # idx + 2 car row 1 = headers et gspread index commence à 1
+            if search_term.lower() in str(row.get('ChefFamille', '')).lower() or search_term.lower() in str(row.get('NomFamille', '')).lower():
+                results.append((idx + 2, row))
+        
+        return True, results
+    except Exception as e:
+        return False, str(e)
+
+def format_data_for_sheet():
+    ordered_row = []
+    keys_order = [q["key"] for q in QUESTIONS_MAIN]
+    for k in keys_order: ordered_row.append(st.session_state.data.get(k, ""))
+    ordered_row.append(st.session_state.data.get("Lat", ""))
+    ordered_row.append(st.session_state.data.get("Long", ""))
+    ordered_row.append(str(datetime.now())) # Date update
+
+    child_fields = ["Nom", "Sexe", "Mere", "Niveau", "Pro", "Grade", "Act_Femme", "Sante", "Maladie", "Aide", "Orga"]
+    for child in st.session_state.children:
+        for field in child_fields: ordered_row.append(child.get(field, ""))
+    
+    # Remplissage vide si moins d'enfants que prévu
+    missing_children = MAX_ENFANTS_PREVISION - len(st.session_state.children)
+    if missing_children > 0:
+        for _ in range(missing_children):
+            for _ in child_fields: ordered_row.append("")
+            
+    return ordered_row
 
 # --- MAIN ---
 def main():
     st.set_page_config(page_title="Sondage Hassi", layout="centered")
 
+    # SESSION STATE INIT
     if "data" not in st.session_state: st.session_state.data = {}
     if "children" not in st.session_state: st.session_state.children = []
     if "q_index" not in st.session_state: st.session_state.q_index = -1
@@ -102,11 +122,85 @@ def main():
     if "child_idx" not in st.session_state: st.session_state.child_idx = 0
     if "in_child_loop" not in st.session_state: st.session_state.in_child_loop = False
     if "edit_mode" not in st.session_state: st.session_state.edit_mode = False
+    
+    # NOUVEAU : Variables pour la mise à jour
+    if "update_row_idx" not in st.session_state: st.session_state.update_row_idx = None
+    if "is_updating" not in st.session_state: st.session_state.is_updating = False
+
+    # --- SIDEBAR : RECHERCHE POUR MODIFICATION ---
+    with st.sidebar:
+        st.header("🔧 MODIFIER / تعديل")
+        st.info("Recherchez une enquête déjà envoyée pour la corriger.")
+        search_query = st.text_input("Nom du Chef / اسم رب الأسرة")
+        
+        if st.button("🔍 Chercher"):
+            if search_query:
+                success, res = search_and_load_data(search_query)
+                if success and res:
+                    st.session_state.search_results = res
+                    st.success(f"{len(res)} trouvé(s)")
+                elif success:
+                    st.warning("Aucun résultat / لا توجد نتائج")
+                else:
+                    st.error(f"Erreur: {res}")
+        
+        if "search_results" in st.session_state:
+            # Choix du résultat
+            options = {f"{r[1].get('ChefFamille')} ({r[1].get('NomFamille')})": r for r in st.session_state.search_results}
+            selected_label = st.selectbox("Sélectionner :", list(options.keys()))
+            
+            if st.button("📂 CHARGER / تحميل"):
+                row_idx, row_data = options[selected_label]
+                
+                # 1. Charger Données Famille
+                st.session_state.data = {}
+                for q in QUESTIONS_MAIN:
+                    k = q["key"]
+                    st.session_state.data[k] = row_data.get(k, "")
+                
+                # Charger GPS
+                st.session_state.data["Lat"] = row_data.get("Lat", "")
+                st.session_state.data["Long"] = row_data.get("Long", "")
+
+                # 2. Charger Enfants (Reconstruction)
+                st.session_state.children = []
+                child_fields = ["Nom", "Sexe", "Mere", "Niveau", "Pro", "Grade", "Act_Femme", "Sante", "Maladie", "Aide", "Orga"]
+                
+                # On boucle jusqu'à 15 pour voir s'il y a des enfants
+                for i in range(1, MAX_ENFANTS_PREVISION + 1):
+                    # On vérifie si le nom de l'enfant existe
+                    c_nom = row_data.get(f"Enfant_{i}_Nom", "")
+                    if c_nom and str(c_nom).strip() != "":
+                        child_dict = {}
+                        for f in child_fields:
+                            child_dict[f] = row_data.get(f"Enfant_{i}_{f}", "")
+                        st.session_state.children.append(child_dict)
+                
+                # Mise à jour du nombre d'enfants dans la logique
+                st.session_state.data["NbEnfants"] = len(st.session_state.children)
+
+                # Activer mode Update
+                st.session_state.update_row_idx = row_idx
+                st.session_state.is_updating = True
+                st.session_state.q_index = 0 # Revenir au début pour vérifier
+                st.rerun()
+
+    # --- LOGIQUE NORMALE ---
+    
+    # Message si en mode mise à jour
+    if st.session_state.is_updating:
+        st.warning(f"⚠️ MODE MODIFICATION : Vous modifiez la ligne {st.session_state.update_row_idx}")
+        if st.button("❌ Annuler Modification"):
+            st.session_state.is_updating = False
+            st.session_state.update_row_idx = None
+            st.session_state.data = {}
+            st.session_state.children = []
+            st.session_state.q_index = -1
+            st.rerun()
 
     # Accueil
     if st.session_state.q_index == -1:
         st.title("📋 Enquête Hassi Elbekay")
-        st.info("Cliquez sur DÉMARRER.")
         l = st.radio("Langue / اللغة", ["Français", "العربية"])
         st.session_state.lang = "fr" if l == "Français" else "ar"
         if st.button("🚀 DÉMARRER / ابدأ", type="primary"):
@@ -141,10 +235,8 @@ def show_main_question(q, lc):
 
     with st.form(key=f"form_{val_key}"):
         res = None
-        if q["type"] == "text":
-            res = st.text_input("Réponse / الجواب", value=old_val if old_val else "")
-        elif q["type"] == "number":
-            res = st.number_input("Nombre", min_value=0, value=int(old_val) if old_val else 0)
+        if q["type"] == "text": res = st.text_input("Réponse / الجواب", value=old_val if old_val else "")
+        elif q["type"] == "number": res = st.number_input("Nombre", min_value=0, value=int(old_val) if old_val else 0)
         elif q["type"] == "radio":
             opts = q[f"opts_{lc}"]
             ix = opts.index(old_val) if old_val in opts else 0
@@ -153,14 +245,13 @@ def show_main_question(q, lc):
             opts = q[f"opts_{lc}"]
             current_selection = old_val
             precision_val = ""
-            if old_val and ("Autre" in str(old_val) or "أخرى" in str(old_val)) and ":" in str(old_val):
+            if old_val and (":" in str(old_val)):
                  current_selection = opts[-1]
                  precision_val = str(old_val).split(":", 1)[1].strip()
             elif old_val not in opts: current_selection = opts[0]
             ix = opts.index(current_selection) if current_selection in opts else 0
             res_radio = st.radio("Choix", opts, index=ix)
-            lbl_prec = "Si 'Autre', précisez ici / حدد هنا إذا اخترت 'أخرى'"
-            res_prec = st.text_input(lbl_prec, value=precision_val)
+            res_prec = st.text_input("Si 'Autre', précisez / حدد", value=precision_val)
             if "Autre" in res_radio or "أخرى" in res_radio: res = f"Autre: {res_prec}" if res_prec else "Autre (Non précisé)"
             else: res = res_radio
         elif q["type"] == "camera":
@@ -186,15 +277,13 @@ def show_main_question(q, lc):
                 st.session_state.data["Lat"] = lat
                 st.session_state.data["Long"] = lng
             
-            # SAUTS
+            # Sauts logiques
             if q["id"] == "Q5" and res and ("Non" in str(res) or "لا" in str(res)):
-                target = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == "Q13")
-                st.session_state.q_index = target
+                st.session_state.q_index = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == "Q13")
                 st.rerun()
                 return
             if q["id"] == "Q13" and res and ("Non" in str(res) or "لا" in str(res)):
-                target = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == "Q26")
-                st.session_state.q_index = target
+                st.session_state.q_index = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == "Q26")
                 st.rerun()
                 return
             if q["id"] == "Q14":
@@ -218,6 +307,7 @@ def handle_child_loop(lc):
     idx = st.session_state.child_idx
     total = st.session_state.data["NbEnfants"]
     st.markdown(f"### 👶 Enfant {idx + 1} / {total}")
+    
     intro = f"Informations pour l'enfant {idx + 1}" if lc == "fr" else f"معلومات الطفل {idx + 1}"
     if "last_spoken_child" not in st.session_state or st.session_state.last_spoken_child != idx:
         play_audio_auto(intro, lc)
@@ -225,13 +315,10 @@ def handle_child_loop(lc):
 
     d = st.session_state.children[idx]
     
-    # CHAMPS ENFANTS
     nom = st.text_input("15. Nom / الاسم", value=d.get("Nom", ""), key=f"c_nom_{idx}")
-    
     opts_sexe = ["Homme", "Femme"] if lc=="fr" else ["رجل", "امرأة"]
     idx_sexe = 0 if d.get("Sexe") != opts_sexe[1] else 1
     sexe = st.radio("16. Sexe / الجنس", opts_sexe, index=idx_sexe, key=f"c_sexe_{idx}")
-    
     mere = st.text_input("17. Nom Mère / اسم الأم", value=d.get("Mere", ""), key=f"c_mere_{idx}")
     
     niv_opts_fr = ["Sans", "Primaire", "Secondaire", "Universitaire", "Mahadra"]
@@ -337,58 +424,54 @@ def show_recap_screen(lc):
         sel = st.selectbox("Modifier Question :", opts)
         if st.button("Aller Modifier"):
             qid = sel.split(" - ")[0]
-            idx = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == qid)
-            st.session_state.q_index = idx
+            st.session_state.q_index = next(i for i, x in enumerate(QUESTIONS_MAIN) if x["id"] == qid)
             st.session_state.edit_mode = True
             st.rerun()
 
     with c2:
         st.write("")
-        if st.button("🚀 ENVOYER / إرسال", type="primary"):
-            with st.spinner("Envoi..."):
+        # Bouton dynamique : Envoyer (Nouveau) ou Mettre à jour (Ancien)
+        btn_text = "💾 METTRE À JOUR / تحديث" if st.session_state.is_updating else "🚀 ENVOYER / إرسال"
+        
+        if st.button(btn_text, type="primary"):
+            with st.spinner("Enregistrement..."):
                 sheet, msg = connect_google_sheet()
                 if sheet:
                     try:
-                        # GESTION AUTOMATIQUE DES EN-TÊTES SI FICHIER VIDE
+                        # Headers si vide
                         try:
-                            # On essaie de lire la ligne 1. Si vide ou erreur -> on crée les titres
-                            first_row = sheet.row_values(1)
-                        except:
-                            first_row = []
+                            if not sheet.row_values(1): sheet.append_row(generate_headers())
+                        except: pass
                         
-                        if not first_row:
-                            headers = generate_headers()
-                            sheet.append_row(headers)
-
-                        # CONSTRUCTION DE LA LIGNE DE DONNÉES
-                        ordered_row = []
-                        # 1. Famille (Q1-Q27)
-                        keys_order = [q["key"] for q in QUESTIONS_MAIN]
-                        for k in keys_order: ordered_row.append(st.session_state.data.get(k, ""))
+                        row_data = format_data_for_sheet()
                         
-                        # 2. GPS et Date
-                        ordered_row.append(st.session_state.data.get("Lat", ""))
-                        ordered_row.append(st.session_state.data.get("Long", ""))
-                        ordered_row.append(str(datetime.now()))
-
-                        # 3. Enfants (Flatten)
-                        child_fields = ["Nom", "Sexe", "Mere", "Niveau", "Pro", "Grade", "Act_Femme", "Sante", "Maladie", "Aide", "Orga"]
-                        for child in st.session_state.children:
-                            for field in child_fields:
-                                ordered_row.append(child.get(field, ""))
-                        
-                        sheet.append_row(ordered_row)
-                        
+                        if st.session_state.is_updating and st.session_state.update_row_idx:
+                            # MISE A JOUR (Update)
+                            # Nécessite de mettre à jour la plage (Range)
+                            # gspread update accepte une liste de cellules. Le plus simple est de tout update par range.
+                            # Ex: A2:AZ2
+                            num_cols = len(row_data)
+                            # On convertit les index colonnes en lettres (A, B... AA...) c'est compliqué.
+                            # Plus simple : sheet.update(f"A{row_idx}", [row_data])
+                            sheet.update(range_name=f"A{st.session_state.update_row_idx}", values=[row_data])
+                            st.success("Mise à jour effectuée avec succès ! / تم التحديث بنجاح")
+                        else:
+                            # NOUVEL ENVOI
+                            sheet.append_row(row_data)
+                            st.success("Envoyé avec succès ! / تم الإرسال بنجاح")
+                            
                         st.balloons()
-                        msg_succes = "🎉 Félicitations ! Le questionnaire a été rempli sans erreur et envoyé avec succès. / مبروك! تم ملء الاستبيان بنجاح وإرساله."
-                        st.success(msg_succes)
-                        play_audio_auto(msg_succes, lc)
-                        time.sleep(5)
+                        play_audio_auto("Opération réussie !", lc)
+                        time.sleep(3)
+                        
+                        # Reset
                         st.session_state.data = {}
                         st.session_state.children = []
-                        st.session_state.q_index = 0
+                        st.session_state.q_index = -1
+                        st.session_state.is_updating = False
+                        st.session_state.update_row_idx = None
                         st.rerun()
-                    except Exception as e: st.error(f"Erreur Envoi: {e}")
+                    except Exception as e: st.error(f"Erreur: {e}")
                 else: st.error(msg)
 
 if __name__ == "__main__":
